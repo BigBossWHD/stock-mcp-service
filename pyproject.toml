@@ -1,0 +1,20 @@
+[project]
+name = "stock-mcp-service"
+version = "1.0.0"
+description = "中国股票市场行情MCP服务"
+authors = [{name = "BigBoss", email = "bigboss@example.com"}]
+requires-python = ">=3.10"
+dependencies = [
+    "akshare>=1.14.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "mcp>=1.0.0",
+    "pytz>=2023.3"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
