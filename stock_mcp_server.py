@@ -313,7 +313,7 @@ class StockDataService:
             return default
 
     async def get_stock_realtime(self, symbol: str) -> Dict[str, Any]:
-        """获取股票实时行情"""
+        """获取股票实时行情（优先实时数据，失败时回退到历史数据）"""
         # 检查请求频率
         if not self._check_rate_limit():
             return {"error": "请求过于频繁，请稍后重试"}
@@ -331,37 +331,105 @@ class StockDataService:
             # 获取当前时间信息
             time_info = time_service.get_current_time()
             
-            # 获取实时行情数据
-            df = ak.stock_zh_a_spot_em()
-            stock_data = df[df['代码'] == symbol]
+            # 策略1：优先尝试获取实时行情数据
+            try:
+                df = ak.stock_zh_a_spot_em()
+                stock_data = df[df['代码'] == symbol]
+                
+                if not stock_data.empty:
+                    row = stock_data.iloc[0]
+                    # 检查数据是否有效（避免NaN值导致的问题）
+                    latest_price = self._safe_convert(row['最新价'], float)
+                    if latest_price > 0:  # 有效的价格数据
+                        result = {
+                            "代码": str(row['代码']),
+                            "名称": str(row['名称']),
+                            "最新价": latest_price,
+                            "涨跌幅": self._safe_convert(row['涨跌幅'], float),
+                            "涨跌额": self._safe_convert(row['涨跌额'], float),
+                            "成交量": self._safe_convert(row['成交量'], int),
+                            "成交额": self._safe_convert(row['成交额'], float),
+                            "振幅": self._safe_convert(row['振幅'], float),
+                            "最高": self._safe_convert(row['最高'], float),
+                            "最低": self._safe_convert(row['最低'], float),
+                            "今开": self._safe_convert(row['今开'], float),
+                            "昨收": self._safe_convert(row['昨收'], float),
+                            "更新时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                            "是否交易时间": time_info.get("是否交易时间", False),
+                            "数据来源": "实时数据接口",
+                            "数据说明": "实时数据" if time_info.get("是否交易时间") else "非交易时间数据"
+                        }
+                        
+                        self._set_cache(cache_key, result)
+                        return result
+                    else:
+                        logger.warning(f"实时数据中股票 {symbol} 价格无效，尝试历史数据")
+                else:
+                    logger.warning(f"实时数据中未找到股票 {symbol}，尝试历史数据")
+                    
+            except Exception as realtime_e:
+                logger.warning(f"获取股票 {symbol} 实时数据失败: {realtime_e}，尝试历史数据")
             
-            if stock_data.empty:
-                return {"error": f"未找到股票代码 {symbol} 的数据"}
-            
-            row = stock_data.iloc[0]
-            result = {
-                "代码": str(row['代码']),
-                "名称": str(row['名称']),
-                "最新价": self._safe_convert(row['最新价'], float),
-                "涨跌幅": self._safe_convert(row['涨跌幅'], float),
-                "涨跌额": self._safe_convert(row['涨跌额'], float),
-                "成交量": self._safe_convert(row['成交量'], int),
-                "成交额": self._safe_convert(row['成交额'], float),
-                "振幅": self._safe_convert(row['振幅'], float),
-                "最高": self._safe_convert(row['最高'], float),
-                "最低": self._safe_convert(row['最低'], float),
-                "今开": self._safe_convert(row['今开'], float),
-                "昨收": self._safe_convert(row['昨收'], float),
-                "更新时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                "是否交易时间": time_info.get("是否交易时间", False),
-                "数据说明": "实时数据" if time_info.get("是否交易时间") else "非交易时间数据"
-            }
-            
-            self._set_cache(cache_key, result)
-            return result
+            # 策略2：回退到历史数据（获取最近的交易日数据）
+            try:
+                end_date = datetime.now().strftime("%Y%m%d")
+                start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+                
+                df_hist = ak.stock_zh_a_hist(symbol=symbol, period='daily', 
+                                           start_date=start_date, end_date=end_date)
+                
+                if not df_hist.empty:
+                    # 获取最新的交易日数据
+                    latest = df_hist.iloc[-1]
+                    prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
+                    
+                    # 计算涨跌额和涨跌幅
+                    change = latest['收盘'] - prev['收盘']
+                    change_pct = (change / prev['收盘'] * 100) if prev['收盘'] != 0 else 0
+                    
+                    # 尝试获取股票名称
+                    stock_name = symbol  # 默认使用代码
+                    try:
+                        # 从股票基本信息获取名称
+                        info_df = ak.stock_individual_info_em(symbol=symbol)
+                        if not info_df.empty:
+                            name_row = info_df[info_df['item'] == '股票简称']
+                            if not name_row.empty:
+                                stock_name = str(name_row['value'].iloc[0])
+                    except:
+                        pass  # 如果获取名称失败，使用代码
+                    
+                    result = {
+                        "代码": symbol,
+                        "名称": stock_name,
+                        "最新价": self._safe_convert(latest['收盘'], float),
+                        "涨跌幅": self._safe_convert(change_pct, float),
+                        "涨跌额": self._safe_convert(change, float),
+                        "成交量": self._safe_convert(latest['成交量'], int),
+                        "成交额": self._safe_convert(latest['成交额'], float),
+                        "振幅": self._safe_convert(latest['振幅'], float),
+                        "最高": self._safe_convert(latest['最高'], float),
+                        "最低": self._safe_convert(latest['最低'], float),
+                        "今开": self._safe_convert(latest['开盘'], float),
+                        "昨收": self._safe_convert(prev['收盘'], float),
+                        "数据日期": latest['日期'].strftime('%Y-%m-%d') if hasattr(latest['日期'], 'strftime') else str(latest['日期']),
+                        "更新时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        "是否交易时间": time_info.get("是否交易时间", False),
+                        "数据来源": "历史数据接口(实时数据不可用)",
+                        "数据说明": "最近交易日收盘数据"
+                    }
+                    
+                    self._set_cache(cache_key, result)
+                    return result
+                else:
+                    return {"error": f"未找到股票代码 {symbol} 的任何数据"}
+                    
+            except Exception as hist_e:
+                logger.error(f"获取股票 {symbol} 历史数据也失败: {hist_e}")
+                return {"error": f"所有数据源均无法获取股票 {symbol} 的数据"}
             
         except Exception as e:
-            logger.error(f"获取股票实时数据失败: {e}")
+            logger.error(f"获取股票数据失败: {e}")
             error_msg = SecurityConfig.sanitize_error_message(e)
             return {"error": f"获取数据失败: {error_msg}"}
     
@@ -453,31 +521,156 @@ class StockDataService:
             # 获取当前时间信息
             time_info = time_service.get_current_time()
             
-            # 获取主要指数数据
-            indices = {
-                "上证指数": "000001",
-                "深证成指": "399001", 
-                "创业板指": "399006",
-                "科创50": "000688",
-                "沪深300": "000300",
-                "中证500": "000905"
+            # 获取主要指数数据 - 按数据源优先级分组
+            indices_config = {
+                # 优先使用历史数据接口的指数（深交所指数）
+                "历史数据优先": {
+                    "深证成指": "399001", 
+                    "创业板指": "399006",
+                    "中小板指": "399005",
+                    "深证100": "399330",
+                    "中证500": "000905"
+                },
+                # 优先使用现货数据接口的指数（上交所指数）
+                "现货数据优先": {
+                    "上证指数": "000001",
+                    "科创50": "000688",
+                    "沪深300": "000300",
+                    "上证50": "000016"
+                }
             }
             
             index_data = {}
             
-            # 混合使用现货数据和历史数据
+            # 处理优先使用历史数据的指数
+            for name, code in indices_config["历史数据优先"].items():
+                try:
+                    # 获取最近7天的数据，确保能获取到最新交易日数据
+                    end_date = datetime.now().strftime("%Y%m%d")
+                    start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+                    
+                    df_hist = ak.index_zh_a_hist(symbol=code, period='daily', 
+                                               start_date=start_date, end_date=end_date)
+                    
+                    if not df_hist.empty:
+                        latest = df_hist.iloc[-1]
+                        prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
+                        
+                        change = latest['收盘'] - prev['收盘']
+                        change_pct = (change / prev['收盘'] * 100) if prev['收盘'] != 0 else 0
+                        
+                        index_data[name] = {
+                            "代码": code,
+                            "最新价": self._safe_convert(latest['收盘'], float),
+                            "涨跌额": self._safe_convert(change, float),
+                            "涨跌幅": self._safe_convert(change_pct, float),
+                            "昨收": self._safe_convert(prev['收盘'], float),
+                            "今开": self._safe_convert(latest['开盘'], float),
+                            "最高": self._safe_convert(latest['最高'], float),
+                            "最低": self._safe_convert(latest['最低'], float),
+                            "成交量": self._safe_convert(latest['成交量'], int),
+                            "成交额": self._safe_convert(latest.get('成交额', 0), float),
+                            "数据日期": latest['日期'].strftime('%Y-%m-%d') if hasattr(latest['日期'], 'strftime') else str(latest['日期']),
+                            "数据来源": "历史数据接口"
+                        }
+                    else:
+                        index_data[name] = {"error": f"无法获取指数 {code} 的历史数据"}
+                        
+                except Exception as e:
+                    logger.warning(f"获取指数 {name}({code}) 历史数据失败: {e}")
+                    index_data[name] = {"error": f"获取失败: {str(e)}"}
+            
+            # 处理优先使用现货数据的指数
             try:
-                # 先尝试从现货数据获取
                 df_spot = ak.stock_zh_index_spot_em()
                 spot_available = not df_spot.empty
                 
-                for name, code in indices.items():
+                for name, code in indices_config["现货数据优先"].items():
                     try:
-                        # 对于深证成指和创业板指，使用历史数据接口获取最新数据
-                        if code in ['399001', '399006', '399005']:
-                            # 获取最近3天的数据，确保能获取到最新交易日数据
+                        if spot_available:
+                            # 尝试多种匹配方式
+                            index_info = None
+                            
+                            # 精确匹配代码
+                            exact_match = df_spot[df_spot['代码'] == code]
+                            if not exact_match.empty:
+                                index_info = exact_match
+                            else:
+                                # 模糊匹配代码
+                                fuzzy_match = df_spot[df_spot['代码'].str.contains(code, na=False)]
+                                if not fuzzy_match.empty:
+                                    index_info = fuzzy_match
+                                else:
+                                    # 按名称匹配
+                                    name_match = df_spot[df_spot['名称'].str.contains(name.replace('指数', '').replace('指', ''), na=False)]
+                                    if not name_match.empty:
+                                        index_info = name_match
+                            
+                            if index_info is not None and not index_info.empty:
+                                row = index_info.iloc[0]
+                                index_data[name] = {
+                                    "代码": str(row['代码']),
+                                    "名称": str(row.get('名称', name)),
+                                    "最新价": self._safe_convert(row['最新价'], float),
+                                    "涨跌额": self._safe_convert(row['涨跌额'], float),
+                                    "涨跌幅": self._safe_convert(row['涨跌幅'], float),
+                                    "昨收": self._safe_convert(row['昨收'], float),
+                                    "今开": self._safe_convert(row['今开'], float),
+                                    "最高": self._safe_convert(row['最高'], float),
+                                    "最低": self._safe_convert(row['最低'], float),
+                                    "成交量": self._safe_convert(row.get('成交量', 0), int),
+                                    "成交额": self._safe_convert(row.get('成交额', 0), float),
+                                    "数据来源": "现货数据接口"
+                                }
+                            else:
+                                # 现货数据中没有，回退到历史数据
+                                end_date = datetime.now().strftime("%Y%m%d")
+                                start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+                                
+                                try:
+                                    df_hist = ak.index_zh_a_hist(symbol=code, period='daily', 
+                                                               start_date=start_date, end_date=end_date)
+                                    
+                                    if not df_hist.empty:
+                                        latest = df_hist.iloc[-1]
+                                        prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
+                                        
+                                        change = latest['收盘'] - prev['收盘']
+                                        change_pct = (change / prev['收盘'] * 100) if prev['收盘'] != 0 else 0
+                                        
+                                        index_data[name] = {
+                                            "代码": code,
+                                            "最新价": self._safe_convert(latest['收盘'], float),
+                                            "涨跌额": self._safe_convert(change, float),
+                                            "涨跌幅": self._safe_convert(change_pct, float),
+                                            "昨收": self._safe_convert(prev['收盘'], float),
+                                            "今开": self._safe_convert(latest['开盘'], float),
+                                            "最高": self._safe_convert(latest['最高'], float),
+                                            "最低": self._safe_convert(latest['最低'], float),
+                                            "成交量": self._safe_convert(latest['成交量'], int),
+                                            "成交额": self._safe_convert(latest.get('成交额', 0), float),
+                                            "数据日期": latest['日期'].strftime('%Y-%m-%d') if hasattr(latest['日期'], 'strftime') else str(latest['日期']),
+                                            "数据来源": "历史数据接口(备用)"
+                                        }
+                                    else:
+                                        index_data[name] = {"error": f"未找到指数代码 {code}"}
+                                except Exception as hist_e:
+                                    index_data[name] = {"error": f"获取指数 {code} 失败: {str(hist_e)}"}
+                        else:
+                            index_data[name] = {"error": "现货数据源不可用"}
+                    
+                    except Exception as e:
+                        logger.warning(f"获取指数 {name}({code}) 失败: {e}")
+                        index_data[name] = {"error": f"获取失败: {str(e)}"}
+                        
+            except Exception as e:
+                logger.warning(f"获取现货指数数据失败: {e}")
+                # 对于现货数据失败的指数，也尝试历史数据
+                for name, code in indices_config["现货数据优先"].items():
+                    if name not in index_data:
+                        try:
                             end_date = datetime.now().strftime("%Y%m%d")
-                            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+                            start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
                             
                             df_hist = ak.index_zh_a_hist(symbol=code, period='daily', 
                                                        start_date=start_date, end_date=end_date)
@@ -499,77 +692,14 @@ class StockDataService:
                                     "最高": self._safe_convert(latest['最高'], float),
                                     "最低": self._safe_convert(latest['最低'], float),
                                     "成交量": self._safe_convert(latest['成交量'], int),
-                                    "数据来源": "历史数据接口"
+                                    "成交额": self._safe_convert(latest.get('成交额', 0), float),
+                                    "数据日期": latest['日期'].strftime('%Y-%m-%d') if hasattr(latest['日期'], 'strftime') else str(latest['日期']),
+                                    "数据来源": "历史数据接口(现货失败备用)"
                                 }
                             else:
-                                index_data[name] = {"error": f"无法获取指数 {code} 的历史数据"}
-                        
-                        # 对于其他指数，尝试从现货数据获取
-                        else:
-                            if spot_available:
-                                index_info = df_spot[df_spot['代码'].str.contains(code, na=False)]
-                                
-                                if not index_info.empty:
-                                    row = index_info.iloc[0]
-                                    index_data[name] = {
-                                        "代码": str(row['代码']),
-                                        "最新价": self._safe_convert(row['最新价'], float),
-                                        "涨跌额": self._safe_convert(row['涨跌额'], float),
-                                        "涨跌幅": self._safe_convert(row['涨跌幅'], float),
-                                        "昨收": self._safe_convert(row['昨收'], float),
-                                        "今开": self._safe_convert(row['今开'], float),
-                                        "最高": self._safe_convert(row['最高'], float),
-                                        "最低": self._safe_convert(row['最低'], float),
-                                        "数据来源": "现货数据接口"
-                                    }
-                                else:
-                                    # 如果现货数据中没有，也尝试历史数据
-                                    end_date = datetime.now().strftime("%Y%m%d")
-                                    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-                                    
-                                    try:
-                                        df_hist = ak.index_zh_a_hist(symbol=code, period='daily', 
-                                                                   start_date=start_date, end_date=end_date)
-                                        
-                                        if not df_hist.empty:
-                                            latest = df_hist.iloc[-1]
-                                            prev = df_hist.iloc[-2] if len(df_hist) > 1 else latest
-                                            
-                                            change = latest['收盘'] - prev['收盘']
-                                            change_pct = (change / prev['收盘'] * 100) if prev['收盘'] != 0 else 0
-                                            
-                                            index_data[name] = {
-                                                "代码": code,
-                                                "最新价": self._safe_convert(latest['收盘'], float),
-                                                "涨跌额": self._safe_convert(change, float),
-                                                "涨跌幅": self._safe_convert(change_pct, float),
-                                                "昨收": self._safe_convert(prev['收盘'], float),
-                                                "今开": self._safe_convert(latest['开盘'], float),
-                                                "最高": self._safe_convert(latest['最高'], float),
-                                                "最低": self._safe_convert(latest['最低'], float),
-                                                "成交量": self._safe_convert(latest['成交量'], int),
-                                                "数据来源": "历史数据接口(备用)"
-                                            }
-                                        else:
-                                            index_data[name] = {"error": f"未找到指数代码 {code}"}
-                                    except Exception as hist_e:
-                                        index_data[name] = {"error": f"获取指数 {code} 失败: {str(hist_e)}"}
-                            else:
-                                index_data[name] = {"error": "现货数据源不可用"}
-                    
-                    except Exception as e:
-                        logger.warning(f"获取指数 {name}({code}) 失败: {e}")
-                        index_data[name] = {"error": f"获取失败: {str(e)}"}
-                        
-            except Exception as e:
-                logger.warning(f"获取指数数据失败: {e}")
-                # 提供基本的指数信息
-                for name, code in indices.items():
-                    index_data[name] = {
-                        "代码": code,
-                        "状态": "数据获取失败",
-                        "错误": str(e)
-                    }
+                                index_data[name] = {"error": f"所有数据源均无法获取指数 {code}"}
+                        except Exception as hist_e:
+                            index_data[name] = {"error": f"备用数据源也失败: {str(hist_e)}"}
             
             result = {
                 "更新时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -577,7 +707,12 @@ class StockDataService:
                 "是否交易日": time_info.get("是否交易日", False),
                 "下一个交易日": time_info.get("下一个交易日", ""),
                 "指数数据": index_data,
-                "数据说明": "实时指数" if time_info.get("是否交易时间") else "非交易时间指数"
+                "数据说明": "实时指数" if time_info.get("是否交易时间") else "非交易时间指数",
+                "查询策略": {
+                    "深交所指数": "优先使用历史数据接口",
+                    "上交所指数": "优先使用现货数据接口，失败时回退到历史数据",
+                    "数据时效性": "历史数据通常为T-1日收盘数据，现货数据可能包含盘中实时数据"
+                }
             }
             
             self._set_cache(cache_key, result)
@@ -588,7 +723,7 @@ class StockDataService:
             return {"error": f"获取市场指数失败: {str(e)}"}
     
     async def search_stock(self, keyword: str) -> Dict[str, Any]:
-        """搜索股票"""
+        """搜索股票（优先实时数据，失败时回退到股票列表）"""
         # 检查请求频率
         if not self._check_rate_limit():
             return {"error": "请求过于频繁，请稍后重试"}
@@ -607,34 +742,130 @@ class StockDataService:
             # 获取当前时间信息
             time_info = time_service.get_current_time()
             
-            # 获取所有A股列表
-            df = ak.stock_zh_a_spot_em()
-            
-            # 按名称或代码搜索
-            result_df = df[
-                df['名称'].str.contains(keyword, na=False) | 
-                df['代码'].str.contains(keyword, na=False)
-            ].head(20)  # 限制返回20条结果
-            
-            if result_df.empty:
-                return {"error": f"未找到包含关键词 '{keyword}' 的股票"}
-            
             search_results = []
-            for _, row in result_df.iterrows():
-                search_results.append({
-                    "代码": str(row['代码']),
-                    "名称": str(row['名称']),
-                    "最新价": self._safe_convert(row['最新价'], float),
-                    "涨跌幅": self._safe_convert(row['涨跌幅'], float),
-                    "成交量": self._safe_convert(row['成交量'], int)
-                })
+            data_source = ""
+            
+            # 策略1：优先尝试从实时数据搜索
+            try:
+                df = ak.stock_zh_a_spot_em()
+                
+                # 按名称或代码搜索
+                result_df = df[
+                    df['名称'].str.contains(keyword, na=False) | 
+                    df['代码'].str.contains(keyword, na=False)
+                ].head(20)  # 限制返回20条结果
+                
+                if not result_df.empty:
+                    for _, row in result_df.iterrows():
+                        # 检查数据有效性
+                        latest_price = self._safe_convert(row['最新价'], float)
+                        if latest_price > 0:  # 有效数据
+                            search_results.append({
+                                "代码": str(row['代码']),
+                                "名称": str(row['名称']),
+                                "最新价": latest_price,
+                                "涨跌幅": self._safe_convert(row['涨跌幅'], float),
+                                "涨跌额": self._safe_convert(row['涨跌额'], float),
+                                "成交量": self._safe_convert(row['成交量'], int),
+                                "成交额": self._safe_convert(row['成交额'], float),
+                                "数据来源": "实时数据"
+                            })
+                    
+                    if search_results:
+                        data_source = "实时数据接口"
+                    else:
+                        logger.warning(f"实时数据中找到匹配项但价格无效，尝试备用方案")
+                else:
+                    logger.warning(f"实时数据中未找到关键词 '{keyword}' 的匹配项，尝试备用方案")
+                    
+            except Exception as realtime_e:
+                logger.warning(f"从实时数据搜索失败: {realtime_e}，尝试备用方案")
+            
+            # 策略2：如果实时数据搜索失败或无结果，使用股票基础信息
+            if not search_results:
+                try:
+                    # 获取股票基础信息列表
+                    stock_info_df = ak.stock_info_a_code_name()
+                    
+                    # 按名称或代码搜索
+                    info_result_df = stock_info_df[
+                        stock_info_df['name'].str.contains(keyword, na=False) | 
+                        stock_info_df['code'].str.contains(keyword, na=False)
+                    ].head(20)
+                    
+                    if not info_result_df.empty:
+                        for _, row in info_result_df.iterrows():
+                            # 尝试获取该股票的最新价格（从历史数据）
+                            try:
+                                code = str(row['code'])
+                                end_date = datetime.now().strftime("%Y%m%d")
+                                start_date = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
+                                
+                                hist_df = ak.stock_zh_a_hist(symbol=code, period='daily', 
+                                                           start_date=start_date, end_date=end_date)
+                                
+                                if not hist_df.empty:
+                                    latest = hist_df.iloc[-1]
+                                    prev = hist_df.iloc[-2] if len(hist_df) > 1 else latest
+                                    
+                                    change = latest['收盘'] - prev['收盘']
+                                    change_pct = (change / prev['收盘'] * 100) if prev['收盘'] != 0 else 0
+                                    
+                                    search_results.append({
+                                        "代码": code,
+                                        "名称": str(row['name']),
+                                        "最新价": self._safe_convert(latest['收盘'], float),
+                                        "涨跌幅": self._safe_convert(change_pct, float),
+                                        "涨跌额": self._safe_convert(change, float),
+                                        "成交量": self._safe_convert(latest['成交量'], int),
+                                        "成交额": self._safe_convert(latest['成交额'], float),
+                                        "数据日期": latest['日期'].strftime('%Y-%m-%d') if hasattr(latest['日期'], 'strftime') else str(latest['日期']),
+                                        "数据来源": "历史数据"
+                                    })
+                                else:
+                                    # 如果没有历史数据，只返回基本信息
+                                    search_results.append({
+                                        "代码": str(row['code']),
+                                        "名称": str(row['name']),
+                                        "最新价": 0,
+                                        "涨跌幅": 0,
+                                        "涨跌额": 0,
+                                        "成交量": 0,
+                                        "成交额": 0,
+                                        "数据来源": "基本信息"
+                                    })
+                            except:
+                                # 如果获取价格失败，只返回基本信息
+                                search_results.append({
+                                    "代码": str(row['code']),
+                                    "名称": str(row['name']),
+                                    "最新价": 0,
+                                    "涨跌幅": 0,
+                                    "涨跌额": 0,
+                                    "成交量": 0,
+                                    "成交额": 0,
+                                    "数据来源": "基本信息"
+                                })
+                        
+                        data_source = "股票基础信息+历史数据"
+                    else:
+                        return {"error": f"未找到包含关键词 '{keyword}' 的股票"}
+                        
+                except Exception as info_e:
+                    logger.error(f"从股票基础信息搜索也失败: {info_e}")
+                    return {"error": f"所有搜索方式均失败，无法找到关键词 '{keyword}' 的股票"}
+            
+            if not search_results:
+                return {"error": f"未找到包含关键词 '{keyword}' 的股票"}
             
             result = {
                 "搜索关键词": keyword,
                 "结果数量": len(search_results),
                 "搜索结果": search_results,
                 "搜索时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                "是否交易时间": time_info.get("是否交易时间", False)
+                "是否交易时间": time_info.get("是否交易时间", False),
+                "数据来源": data_source,
+                "搜索策略": "优先实时数据，失败时回退到基础信息+历史数据"
             }
             
             self._set_cache(cache_key, result)
