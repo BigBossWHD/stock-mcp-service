@@ -1,0 +1,20 @@
+[project]
+name = "stock-mcp-service"
+version = "1.0.0"
+description = "中国股票市场行情MCP服务"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "akshare>=1.12.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "requests>=2.31.0",
+    "pytz>=2023.3"
+]
+
+[tool.uv]
+dev-dependencies = [] 
