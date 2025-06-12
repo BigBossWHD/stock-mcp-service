@@ -22,11 +22,169 @@ logger = logging.getLogger("stock-mcp-server")
 # 创建MCP服务器实例
 mcp = FastMCP("中国股票市场行情服务")
 
+class SecurityConfig:
+    """安全配置类"""
+    MAX_HISTORY_DAYS = 365  # 历史数据最大天数限制
+    MAX_TECHNICAL_DAYS = 120  # 技术指标最大天数限制
+    CACHE_TIMEOUT = 300  # 缓存超时时间（秒）
+    RATE_LIMIT_REQUESTS = 100  # 每分钟最大请求数
+    
+    @staticmethod
+    def sanitize_error_message(error: Exception) -> str:
+        """清理错误消息，避免泄露内部细节"""
+        error_str = str(error)
+        # 移除可能的敏感信息
+        sensitive_patterns = [
+            r'File ".*?"',  # 文件路径
+            r'line \d+',    # 行号
+            r'0x[0-9a-fA-F]+',  # 内存地址
+        ]
+        
+        import re
+        for pattern in sensitive_patterns:
+            error_str = re.sub(pattern, '[REDACTED]', error_str)
+        
+        # 返回通用错误消息
+        if "网络" in error_str or "连接" in error_str or "timeout" in error_str.lower():
+            return "数据获取超时，请稍后重试"
+        elif "权限" in error_str or "permission" in error_str.lower():
+            return "数据访问受限"
+        elif "格式" in error_str or "format" in error_str.lower():
+            return "数据格式错误"
+        else:
+            return "服务暂时不可用，请稍后重试"
+
+class TradingCalendarService:
+    """交易日历服务类"""
+    
+    def __init__(self):
+        self._trading_calendar_cache = {}
+        self._cache_date = None
+    
+    def _get_trading_calendar(self, year: int) -> pd.DataFrame:
+        """获取指定年份的交易日历"""
+        cache_key = f"trading_calendar_{year}"
+        
+        # 检查缓存
+        if (cache_key in self._trading_calendar_cache and 
+            self._cache_date and 
+            (datetime.now() - self._cache_date).days < 1):
+            return self._trading_calendar_cache[cache_key]
+        
+        try:
+            # 使用akshare获取交易日历
+            calendar_df = ak.tool_trade_date_hist_sina()
+            if not calendar_df.empty:
+                # 过滤指定年份的数据
+                calendar_df['trade_date'] = pd.to_datetime(calendar_df['trade_date'])
+                year_calendar = calendar_df[calendar_df['trade_date'].dt.year == year]
+                
+                self._trading_calendar_cache[cache_key] = year_calendar
+                self._cache_date = datetime.now()
+                return year_calendar
+        except Exception as e:
+            logger.warning(f"获取交易日历失败，使用简单判断: {e}")
+        
+        return pd.DataFrame()
+    
+    def is_trading_day(self, dt: datetime) -> bool:
+        """判断是否为交易日（使用真实交易日历）"""
+        try:
+            year = dt.year
+            calendar_df = self._get_trading_calendar(year)
+            
+            if not calendar_df.empty:
+                date_str = dt.strftime('%Y-%m-%d')
+                trading_dates = calendar_df['trade_date'].dt.strftime('%Y-%m-%d').tolist()
+                return date_str in trading_dates
+            else:
+                # 回退到简单判断：周一到周五，排除明显的节假日
+                if dt.weekday() >= 5:  # 周末
+                    return False
+                
+                # 简单的节假日判断（可以根据需要扩展）
+                month, day = dt.month, dt.day
+                
+                # 元旦
+                if month == 1 and day == 1:
+                    return False
+                # 春节期间（简化判断）
+                if month == 1 and 20 <= day <= 30:
+                    return False
+                if month == 2 and 1 <= day <= 10:
+                    return False
+                # 清明节期间
+                if month == 4 and 3 <= day <= 6:
+                    return False
+                # 劳动节
+                if month == 5 and 1 <= day <= 3:
+                    return False
+                # 端午节期间
+                if month == 6 and 20 <= day <= 25:
+                    return False
+                # 中秋节期间
+                if month == 9 and 15 <= day <= 17:
+                    return False
+                # 国庆节
+                if month == 10 and 1 <= day <= 7:
+                    return False
+                
+                return True
+                
+        except Exception as e:
+            logger.warning(f"交易日判断失败，使用简单判断: {e}")
+            # 回退到最简单的判断
+            return dt.weekday() < 5
+    
+    def get_trading_days_in_range(self, start_date: datetime, end_date: datetime) -> List[datetime]:
+        """获取指定日期范围内的所有交易日"""
+        trading_days = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            if self.is_trading_day(current_date):
+                trading_days.append(current_date)
+            current_date += timedelta(days=1)
+        
+        return trading_days
+    
+    def get_last_n_trading_days(self, n: int, end_date: Optional[datetime] = None) -> List[datetime]:
+        """获取最近N个交易日"""
+        if end_date is None:
+            end_date = datetime.now()
+        
+        trading_days = []
+        current_date = end_date
+        days_checked = 0
+        max_days_to_check = n * 3  # 防止无限循环
+        
+        while len(trading_days) < n and days_checked < max_days_to_check:
+            if self.is_trading_day(current_date):
+                trading_days.append(current_date)
+            current_date -= timedelta(days=1)
+            days_checked += 1
+        
+        return list(reversed(trading_days))
+    
+    def get_next_trading_day(self, dt: datetime) -> datetime:
+        """获取下一个交易日"""
+        next_day = dt + timedelta(days=1)
+        days_checked = 0
+        max_days_to_check = 10  # 防止无限循环
+        
+        while not self.is_trading_day(next_day) and days_checked < max_days_to_check:
+            next_day += timedelta(days=1)
+            days_checked += 1
+        
+        return next_day
+
 class TimeService:
     """时间服务类"""
     
-    @staticmethod
-    def get_current_time(timezone: str = "Asia/Shanghai") -> Dict[str, Any]:
+    def __init__(self):
+        self.trading_calendar = TradingCalendarService()
+    
+    def get_current_time(self, timezone: str = "Asia/Shanghai") -> Dict[str, Any]:
         """获取当前时间"""
         try:
             tz = pytz.timezone(timezone)
@@ -36,23 +194,17 @@ class TimeService:
                 "当前时间": current_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "时区": timezone,
                 "时间戳": int(current_time.timestamp()),
-                "是否交易日": TimeService.is_trading_day(current_time),
-                "是否交易时间": TimeService.is_trading_time(current_time),
-                "下一个交易日": TimeService.get_next_trading_day(current_time).strftime("%Y-%m-%d")
+                "是否交易日": self.trading_calendar.is_trading_day(current_time),
+                "是否交易时间": self.is_trading_time(current_time),
+                "下一个交易日": self.trading_calendar.get_next_trading_day(current_time).strftime("%Y-%m-%d")
             }
         except Exception as e:
-            return {"error": f"获取时间失败: {str(e)}"}
+            error_msg = SecurityConfig.sanitize_error_message(e)
+            return {"error": f"获取时间失败: {error_msg}"}
     
-    @staticmethod
-    def is_trading_day(dt: datetime) -> bool:
-        """判断是否为交易日（简单判断，不考虑节假日）"""
-        # 周一到周五为交易日
-        return dt.weekday() < 5
-    
-    @staticmethod
-    def is_trading_time(dt: datetime) -> bool:
+    def is_trading_time(self, dt: datetime) -> bool:
         """判断是否为交易时间"""
-        if not TimeService.is_trading_day(dt):
+        if not self.trading_calendar.is_trading_day(dt):
             return False
         
         time = dt.time()
@@ -66,22 +218,31 @@ class TimeService:
         
         return (morning_start <= time <= morning_end) or (afternoon_start <= time <= afternoon_end)
     
-    @staticmethod
-    def get_next_trading_day(dt: datetime) -> datetime:
-        """获取下一个交易日"""
-        next_day = dt + timedelta(days=1)
-        while not TimeService.is_trading_day(next_day):
-            next_day += timedelta(days=1)
-        return next_day
-    
-    @staticmethod
-    def get_date_range_for_days(days: int, end_date: Optional[datetime] = None) -> tuple:
-        """获取指定天数的日期范围"""
+    def get_date_range_for_days(self, days: int, end_date: Optional[datetime] = None) -> tuple:
+        """获取指定天数的日期范围（基于自然日）"""
         if end_date is None:
             end_date = datetime.now()
         
         start_date = end_date - timedelta(days=days)
         return start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
+    
+    def get_date_range_for_trading_days(self, trading_days: int, end_date: Optional[datetime] = None) -> tuple:
+        """获取指定交易日数量的日期范围"""
+        if end_date is None:
+            end_date = datetime.now()
+        
+        # 限制交易日数量
+        trading_days = min(trading_days, SecurityConfig.MAX_HISTORY_DAYS // 2)
+        
+        # 获取最近N个交易日
+        trading_day_list = self.trading_calendar.get_last_n_trading_days(trading_days, end_date)
+        
+        if trading_day_list:
+            start_date = trading_day_list[0]
+            return start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
+        else:
+            # 回退到自然日计算
+            return self.get_date_range_for_days(trading_days * 2, end_date)
 
 # 创建时间服务实例
 time_service = TimeService()
@@ -91,7 +252,32 @@ class StockDataService:
     
     def __init__(self):
         self.cache = {}
-        self.cache_timeout = 300  # 5分钟缓存
+        self.cache_timeout = SecurityConfig.CACHE_TIMEOUT
+        self.request_count = {}
+        self.last_reset_time = datetime.now()
+    
+    def _check_rate_limit(self, client_id: str = "default") -> bool:
+        """检查请求频率限制"""
+        current_time = datetime.now()
+        
+        # 每分钟重置计数器
+        if (current_time - self.last_reset_time).seconds >= 60:
+            self.request_count = {}
+            self.last_reset_time = current_time
+        
+        # 检查请求数量
+        count = self.request_count.get(client_id, 0)
+        if count >= SecurityConfig.RATE_LIMIT_REQUESTS:
+            return False
+        
+        self.request_count[client_id] = count + 1
+        return True
+    
+    def _validate_days_parameter(self, days: int, max_days: int) -> int:
+        """验证并限制days参数"""
+        if days <= 0:
+            return 30  # 默认值
+        return min(days, max_days)
     
     def _is_cache_valid(self, key: str) -> bool:
         """检查缓存是否有效"""
@@ -128,12 +314,20 @@ class StockDataService:
 
     async def get_stock_realtime(self, symbol: str) -> Dict[str, Any]:
         """获取股票实时行情"""
+        # 检查请求频率
+        if not self._check_rate_limit():
+            return {"error": "请求过于频繁，请稍后重试"}
+        
         cache_key = f"realtime_{symbol}"
         cached_data = self._get_from_cache(cache_key)
         if cached_data:
             return cached_data
         
         try:
+            # 验证股票代码格式
+            if not symbol or len(symbol) != 6 or not symbol.isdigit():
+                return {"error": "股票代码格式错误，请输入6位数字代码"}
+            
             # 获取当前时间信息
             time_info = time_service.get_current_time()
             
@@ -168,38 +362,56 @@ class StockDataService:
             
         except Exception as e:
             logger.error(f"获取股票实时数据失败: {e}")
-            return {"error": f"获取数据失败: {str(e)}"}
+            error_msg = SecurityConfig.sanitize_error_message(e)
+            return {"error": f"获取数据失败: {error_msg}"}
     
     async def get_stock_history(self, symbol: str, period: str = "daily", 
-                               start_date: str = None, end_date: str = None) -> Dict[str, Any]:
+                               start_date: str = None, end_date: str = None,
+                               days: int = None) -> Dict[str, Any]:
         """获取股票历史数据"""
-        cache_key = f"history_{symbol}_{period}_{start_date}_{end_date}"
+        # 检查请求频率
+        if not self._check_rate_limit():
+            return {"error": "请求过于频繁，请稍后重试"}
+        
+        # 验证股票代码格式
+        if not symbol or len(symbol) != 6 or not symbol.isdigit():
+            return {"error": "股票代码格式错误，请输入6位数字代码"}
+        
+        # 验证并限制days参数
+        if days is not None:
+            days = self._validate_days_parameter(days, SecurityConfig.MAX_HISTORY_DAYS)
+        
+        cache_key = f"history_{symbol}_{period}_{start_date}_{end_date}_{days}"
         cached_data = self._get_from_cache(cache_key)
         if cached_data:
             return cached_data
         
         try:
-            # 如果没有指定日期，使用智能日期范围
+            # 智能日期范围处理
             if not end_date or not start_date:
                 current_time = datetime.now()
                 if not end_date:
                     end_date = current_time.strftime("%Y%m%d")
                 if not start_date:
-                    # 默认获取30个交易日的数据
-                    start_date = (current_time - timedelta(days=45)).strftime("%Y%m%d")
+                    if days:
+                        # 使用基于交易日的日期范围
+                        start_date, end_date = time_service.get_date_range_for_trading_days(days, current_time)
+                    else:
+                        # 默认获取30个交易日的数据
+                        start_date, end_date = time_service.get_date_range_for_trading_days(30, current_time)
             
             # 获取历史数据
             df = ak.stock_zh_a_hist(symbol=symbol, period=period, 
                                    start_date=start_date, end_date=end_date)
             
             if df.empty:
-                return {"error": f"未找到股票代码 {symbol} 的历史数据"}
+                return {"error": f"未找到股票代码 {symbol} 在指定时间范围内的历史数据"}
             
             # 转换数据格式
             history_data = []
             for _, row in df.iterrows():
                 history_data.append({
-                    "日期": row['日期'].strftime("%Y-%m-%d") if pd.notna(row['日期']) else "",
+                    "日期": str(row['日期']),
                     "开盘": self._safe_convert(row['开盘'], float),
                     "收盘": self._safe_convert(row['收盘'], float),
                     "最高": self._safe_convert(row['最高'], float),
@@ -212,13 +424,14 @@ class StockDataService:
                     "换手率": self._safe_convert(row['换手率'], float)
                 })
             
-            time_info = time_service.get_current_time()
             result = {
-                "股票代码": symbol,
-                "查询期间": f"{start_date} 至 {end_date}",
+                "代码": symbol,
+                "周期": period,
+                "开始日期": start_date,
+                "结束日期": end_date,
                 "数据条数": len(history_data),
                 "历史数据": history_data,
-                "查询时间": time_info.get("当前时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                "数据说明": f"获取了{len(history_data)}条{period}数据"
             }
             
             self._set_cache(cache_key, result)
@@ -226,7 +439,8 @@ class StockDataService:
             
         except Exception as e:
             logger.error(f"获取股票历史数据失败: {e}")
-            return {"error": f"获取历史数据失败: {str(e)}"}
+            error_msg = SecurityConfig.sanitize_error_message(e)
+            return {"error": f"获取历史数据失败: {error_msg}"}
     
     async def get_market_index(self) -> Dict[str, Any]:
         """获取主要市场指数"""
@@ -375,6 +589,20 @@ class StockDataService:
     
     async def search_stock(self, keyword: str) -> Dict[str, Any]:
         """搜索股票"""
+        # 检查请求频率
+        if not self._check_rate_limit():
+            return {"error": "请求过于频繁，请稍后重试"}
+        
+        # 验证关键词
+        if not keyword or len(keyword.strip()) < 1:
+            return {"error": "搜索关键词不能为空"}
+        
+        keyword = keyword.strip()
+        cache_key = f"search_{keyword}"
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
         try:
             # 获取当前时间信息
             time_info = time_service.get_current_time()
@@ -401,7 +629,7 @@ class StockDataService:
                     "成交量": self._safe_convert(row['成交量'], int)
                 })
             
-            return {
+            result = {
                 "搜索关键词": keyword,
                 "结果数量": len(search_results),
                 "搜索结果": search_results,
@@ -409,9 +637,13 @@ class StockDataService:
                 "是否交易时间": time_info.get("是否交易时间", False)
             }
             
+            self._set_cache(cache_key, result)
+            return result
+            
         except Exception as e:
             logger.error(f"搜索股票失败: {e}")
-            return {"error": f"搜索失败: {str(e)}"}
+            error_msg = SecurityConfig.sanitize_error_message(e)
+            return {"error": f"搜索失败: {error_msg}"}
     
     def calculate_ma(self, prices: List[float], period: int) -> List[float]:
         """计算移动平均线"""
@@ -575,10 +807,26 @@ class StockDataService:
     async def get_technical_indicators(self, symbol: str, period: str = "daily", 
                                      days: int = 60) -> Dict[str, Any]:
         """获取技术指标"""
+        # 检查请求频率
+        if not self._check_rate_limit():
+            return {"error": "请求过于频繁，请稍后重试"}
+        
+        # 验证股票代码格式
+        if not symbol or len(symbol) != 6 or not symbol.isdigit():
+            return {"error": "股票代码格式错误，请输入6位数字代码"}
+        
+        # 验证并限制days参数
+        days = self._validate_days_parameter(days, SecurityConfig.MAX_TECHNICAL_DAYS)
+        
+        cache_key = f"technical_{symbol}_{period}_{days}"
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
         try:
-            # 获取历史数据
+            # 获取历史数据（需要额外的数据来计算技术指标）
             end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=days+30)).strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=days+60)).strftime("%Y%m%d")
             
             df = ak.stock_zh_a_hist(symbol=symbol, period=period, 
                                    start_date=start_date, end_date=end_date)
@@ -636,7 +884,7 @@ class StockDataService:
             # 获取时间信息
             time_info = time_service.get_current_time()
             
-            return {
+            result = {
                 "股票代码": symbol,
                 "指标数据": indicators,
                 "技术状态": technical_status,
@@ -645,9 +893,13 @@ class StockDataService:
                 "数据说明": f"获取{days}天技术指标数据"
             }
             
+            self._set_cache(cache_key, result)
+            return result
+            
         except Exception as e:
             logger.error(f"获取技术指标失败: {e}")
-            return {"error": f"获取技术指标失败: {str(e)}"}
+            error_msg = SecurityConfig.sanitize_error_message(e)
+            return {"error": f"获取技术指标失败: {error_msg}"}
     
     def _analyze_technical_status(self, latest_data: Dict) -> Dict[str, str]:
         """分析技术状态"""
@@ -769,12 +1021,14 @@ async def get_stock_realtime(symbol: str) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"获取股票实时数据失败: {e}")
-        return json.dumps({"error": f"获取数据失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"获取数据失败: {error_msg}"}, ensure_ascii=False)
 
 @mcp.tool()
 async def get_stock_history(symbol: str, period: str = "daily", 
                            start_date: Optional[str] = None, 
-                           end_date: Optional[str] = None) -> str:
+                           end_date: Optional[str] = None,
+                           days: Optional[int] = None) -> str:
     """获取股票历史数据
     
     Args:
@@ -782,20 +1036,25 @@ async def get_stock_history(symbol: str, period: str = "daily",
         period: 数据周期，daily(日线), weekly(周线), monthly(月线)，默认daily
         start_date: 开始日期，格式YYYYMMDD，默认为30天前
         end_date: 结束日期，格式YYYYMMDD，默认为今天
+        days: 获取天数，如果指定则忽略start_date，基于交易日计算
     
     Returns:
         股票历史数据的JSON字符串
     """
     try:
-        result = await stock_service.get_stock_history(symbol, period, start_date, end_date)
+        result = await stock_service.get_stock_history(symbol, period, start_date, end_date, days)
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"获取股票历史数据失败: {e}")
-        return json.dumps({"error": f"获取历史数据失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"获取历史数据失败: {error_msg}"}, ensure_ascii=False)
 
 @mcp.tool()
-async def get_market_index() -> str:
+async def get_market_index(random_string: str = "dummy") -> str:
     """获取主要市场指数（上证指数、深证成指、创业板指、科创50）
+    
+    Args:
+        random_string: 占位参数，用于无参数工具的兼容性
     
     Returns:
         市场指数数据的JSON字符串
@@ -805,7 +1064,8 @@ async def get_market_index() -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"获取市场指数失败: {e}")
-        return json.dumps({"error": f"获取市场指数失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"获取市场指数失败: {error_msg}"}, ensure_ascii=False)
 
 @mcp.tool()
 async def search_stock(keyword: str) -> str:
@@ -822,7 +1082,8 @@ async def search_stock(keyword: str) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"搜索股票失败: {e}")
-        return json.dumps({"error": f"搜索失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"搜索失败: {error_msg}"}, ensure_ascii=False)
 
 @mcp.tool()
 async def get_technical_indicators(symbol: str, period: str = "daily", days: int = 30) -> str:
@@ -831,7 +1092,7 @@ async def get_technical_indicators(symbol: str, period: str = "daily", days: int
     Args:
         symbol: 股票代码，如 '000001' 或 '600000'
         period: 数据周期，daily(日线), weekly(周线), monthly(月线)，默认daily
-        days: 获取天数，默认30天
+        days: 获取天数，默认30天，最大120天
     
     Returns:
         技术指标数据的JSON字符串，包含MA、MACD、RSI等指标和技术状态分析
@@ -841,7 +1102,8 @@ async def get_technical_indicators(symbol: str, period: str = "daily", days: int
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"获取技术指标失败: {e}")
-        return json.dumps({"error": f"获取技术指标失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"获取技术指标失败: {error_msg}"}, ensure_ascii=False)
 
 @mcp.tool()
 async def get_comprehensive_analysis(symbol: str) -> str:
@@ -888,7 +1150,8 @@ async def get_comprehensive_analysis(symbol: str) -> str:
         
     except Exception as e:
         logger.error(f"获取综合分析失败: {e}")
-        return json.dumps({"error": f"获取综合分析失败: {str(e)}"}, ensure_ascii=False)
+        error_msg = SecurityConfig.sanitize_error_message(e)
+        return json.dumps({"error": f"获取综合分析失败: {error_msg}"}, ensure_ascii=False)
 
 if __name__ == "__main__":
     mcp.run() 
